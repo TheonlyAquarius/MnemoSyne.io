@@ -17,7 +17,8 @@ You must adhere to the following architectural principles throughout the impleme
 
 -----
 
-## 3. Project Architecture
+## 3\. Project Architecture
+
 
 You will refactor the existing files into the following directory structure:
 
@@ -37,7 +38,8 @@ You will refactor the existing files into the following directory structure:
 
 -----
 
-## 4. Detailed Implementation Tasks
+
+
 
 ### Task 4.1: Implement `utils.py`
 
@@ -63,7 +65,9 @@ Create the file for the `PerceiverOptimizer` class within the `models/` director
 
   * Be a `torch.nn.Module`.
   * Use the `PerceiverIO` model from the repository as its core component.
-  * Be initialized with hyperparameters for the Perceiver (e.g., depth, num_latents, latent_dim).
+
+  * Be initialized with hyperparameters for the Perceiver (e.g., depth, num\_latents, latent\_dim).
+
   * Its `forward` method must accept a flattened weight tensor and a timestep tensor. For the permutation training, it must accept a start weight tensor, a start time, and an end time.
   * The implementation must correctly reshape and combine the weight and time inputs into a single sequence for the Perceiver, and reshape the output back into a flattened weight tensor. This implementation must be architecture-agnostic.
 
@@ -86,9 +90,9 @@ This will be the main entry point for all operations. It must:
       * Implement checkpointing: save the model state periodically to the `checkpoints/` directory.
       * Implement resuming: if a `--resume-from` flag is provided with a path to a checkpoint, the script must load the model state and continue training from that point.
 
------
 
-## 5. Testing & Experimentation Protocol
+## 5\. Testing & Experimentation Protocol
+
 
 After implementing the above, you are to verify your work by running the following experimental protocol:
 
@@ -106,9 +110,8 @@ After implementing the above, you are to verify your work by running the followi
     python train.py train-optimizer --run-name "cnn_initial_test" --epochs 10 --resume-from "checkpoints/PerceiverOptimizer_epoch_19.safetensors"
     ```
 
-Report on the successful completion of this protocol.
+## 6. Implementation Constraints and Directives 
 
-## 6. Implementation Constraints and Directives
 
 In addition to the tasks outlined above, you must strictly adhere to the following constraints during all implementation phases.
 
@@ -128,6 +131,8 @@ Your primary strategy must be to adapt and integrate the existing, high-quality 
 * **The Target CNN**: Similarly, the `TargetCNN` is already defined and should be imported and used as-is.
 * **The Exception**: The main exception to this rule is the new master script, `train.py`. This script is intended to be a new file that orchestrates and controls the various adapted components from a central location.
 
+
+
 ## 7. Principle II: Maximization of Information Density
 
 Every element of a generated artifact must serve a necessary and sufficient purpose. All redundant, tautological, or conversational elements must be eliminated.
@@ -143,4 +148,5 @@ All outputs are functional components of a research apparatus. Your role is to p
 * **8.1. Modern Standards are Non-Negotiable**:
     * **Serialization**: All model weights, checkpoints, and artifacts must be saved and loaded using the `safetensors` format for safety, speed, and interoperability. The use of Python's `pickle` format (`.pth`) for saving model weights is forbidden.
     * **Environment**: The agent must assume a standard, modern Python environment. All necessary third-party libraries (e.g., `torch`, `safetensors`, `gymnasium`) are expected to be available.
+
 
