@@ -9,15 +9,14 @@ from perceiver_pytorch.perceiver_io import PerceiverIO
 class PerceiverOptimizer(nn.Module):
     def __init__(
         self,
-        *,
         flat_dim: int,
         num_latents: int = 512,
         latent_dim: int = 512,
-        cross_heads: int = 1,
+        cross_heads: int = 8,
         latent_heads: int = 8,
         cross_dim_head: int = 64,
         latent_dim_head: int = 64,
-        depth: int = 6,
+        depth: int = 8,
         seq_dropout_prob: float = 0.0,
     ) -> None:
         super().__init__()
