@@ -1,146 +1,328 @@
-# AGENTS.MD
+#!/usr/bin/env python
+"""
+train_diffusion_config.py
+=========================
+Fully‑configurable trainer for a *weight‑space denoiser* (a.k.a. SynthNet).
+All hyper‑parameters can be supplied from the CLI **or** a YAML/JSON file so
+**nothing is hard‑coded**.
 
-## 1. The Core Mission
-
-Your primary objective is to refactor the existing proof-of-concept repository into a robust, flexible, and extensible research framework. This involves replacing the current collection of single-purpose scripts with a single, powerful, configuration-driven training script. The new framework will replace the simple MLP optimizer with a more powerful `PerceiverIO` model and adopt modern standards like `safetensors` for all weight handling.
-
------
-
-## 2. Guiding Principles
-
-You must adhere to the following architectural principles throughout the implementation:
-
-  * **Configuration Over Hardcoding**: All experimental parameters (model names, learning rates, epochs, file paths, etc.) must be configurable via command-line arguments or a central configuration file. There should be no hardcoded values in the core logic.
-  * **Modularity and Separation of Concerns**: Each component (data loading, model definitions, utility functions, training logic) must be in its own dedicated file. This ensures the codebase is easy to read, maintain, and extend.
-  * **Architecture Agnosticism**: The core training script must not be tied to any single model architecture. It should be possible to train a new target model (e.g., a ResNet) or a new optimizer model by simply changing a configuration value, without altering the training script itself.
-  * **Safety and Modern Standards**: All model weights and checkpoints must be saved and loaded using the `safetensors` format for safety, speed, and interoperability.
-
------
-
-## 3. Project Architecture
-
-You will refactor the existing files into the following directory structure:
-
-```
-/
-├── train.py                  # The new, centralized master training script.
-├── utils.py                  # Helper functions (safetensors, model factory).
-├── dataset.py                # The enhanced WeightTrajectoryDataset.
-├── models/
-│   ├── __init__.py
-│   ├── target_cnn.py         # The existing CNN model.
-│   └── perceiver_optimizer.py  # The new PerceiverIO-based optimizer.
-├── data/                       # (for MNIST dataset)
-├── trajectories/               # Directory for storing saved weight trajectories.
-└── checkpoints/                # Directory for saving optimizer model checkpoints.
+Example (command‑line only)
+---------------------------
+```bash
+python train_diffusion_config.py \
+  --checkpoints-dir checkpoints_weights_cnn \
+  --model mlp --time-emb-dim 64 --hidden-dim 762 \
+  --pairing noisy2clean --epochs 80 --lr 9e-4 --batch-size 64
 ```
 
------
+Example (YAML)
+--------------
+```yaml
+# cfg.yml
+checkpoints_dir: checkpoints_weights_cnn
+model: mlp
+pairing: init2final
+batch_size: 128
+epochs: 120
+lr: 1.0e-3
+time_emb_dim: 64
+hidden_dim: 768
+trajectory_sample_factor: 0.5
+```
+```bash
+python train_diffusion_config.py --config cfg.yml
+```
+"""
 
-## 4. Detailed Implementation Tasks
+from __future__ import annotations
 
-### Task 4.1: Implement `utils.py`
+import argparse
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Any, Tuple
 
-Create a file named `utils.py` containing the following helper functions:
+import yaml
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
-  * A function `get_target_model(name: str)` that takes a model name as a string and returns an initialized instance of that model (e.g., `TargetCNN`).
-  * A function `get_optimizer_model(name: str)` that returns an instance of a generative optimizer model (e.g., `PerceiverOptimizer`).
-  * A function `save_model_weights(model, filepath)` that saves a model's state dictionary to the specified path using `safetensors.torch.save_file`.
-  * A function `load_model_weights(model, filepath)` that loads weights from a `.safetensors` file into a model instance.
+ ---- local modules (assumed already present in project) --------------------
+from diffusion_model import (
+    SimpleWeightSpaceDiffusion,
+    flatten_state_dict,
+    get_target_model_flat_dim,
+)
+from target_cnn import TargetCNN
 
-### Task 4.2: Implement `dataset.py`
+# ---------------------------------------------------------------------------
+# 1. Configuration helpers
+# ---------------------------------------------------------------------------
 
-Create a file named `dataset.py` containing the `WeightTrajectoryDataset` class. This class must:
 
-  * Be initialized with a `trajectory_dir` and a `mode` argument ('sequential' or 'permutation').
-  * In 'sequential' mode, it should provide consecutive pairs of weights `(W_t, W_{t+1})`.
-  * In 'permutation' mode, it should provide all possible forward-moving pairs of weights `(W_i, W_j)` where `i < j`.
-  * The `__getitem__` method should return the start weights, the end weights, and their corresponding timesteps `t_start` and `t_end`.
+def parse_cfg() -> argparse.Namespace:
+    """Parse CLI and optional YAML/JSON file."""
 
-### Task 4.3: Implement `models/perceiver_optimizer.py`
+    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-Create the file for the `PerceiverOptimizer` class within the `models/` directory. This class must:
+    # I/O ------------------------------------------------------------------
+    p.add_argument("--checkpoints-dir", required=False,
+                   help="Directory containing 'weights_epoch_*.pth' files")
+    p.add_argument("--config", help="YAML or JSON file to override/define args")
+    p.add_argument("--save-path", default="diffusion_optimizer.pth",
+                   help="Where to save trained model state_dict")
 
-  * Be a `torch.nn.Module`.
-  * Use the `PerceiverIO` model from the repository as its core component.
-  * Be initialized with hyperparameters for the Perceiver (e.g., depth, num_latents, latent_dim).
-  * Its `forward` method must accept a flattened weight tensor and a timestep tensor. For the permutation training, it must accept a start weight tensor, a start time, and an end time.
-  * The implementation must correctly reshape and combine the weight and time inputs into a single sequence for the Perceiver, and reshape the output back into a flattened weight tensor. This implementation must be architecture-agnostic.
+    # dataset --------------------------------------------------------------
+    p.add_argument("--pairing", choices=["trajectory", "noisy2clean", "init2final"],
+                   default="trajectory", help="How to build (src→tgt) pairs")
+    p.add_argument("--trajectory-sample-factor", type=float, default=1.0,
+                   help="Fraction of pairs to keep if pairing explodes in size")
 
-### Task 4.4: Implement `train.py`
+    # model family ---------------------------------------------------------
+    p.add_argument("--model", choices=["mlp"], default="mlp",
+                   help="Denoiser architecture (only 'mlp' supported today)")
+    p.add_argument("--time-emb-dim", type=int, default=64,
+                   help="Dimensionality of timestep embedding (if used)")
+    p.add_argument("--hidden-dim", type=int, default=762,
+                   help="Hidden dimension of the MLP denoiser")
 
-This will be the main entry point for all operations. It must:
+    # optimisation ---------------------------------------------------------
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--lr", type=float, default=1e-3)
 
-  * Use Python's `argparse` library to handle command-line arguments.
-  * Have two main modes of operation (phases): `train-target` and `train-optimizer`.
-  * **In `train-target` mode:**
-      * Dynamically load the target model architecture specified by a `--target-model` flag.
-      * Train it on a dataset (e.g., MNIST).
-      * Allow the optimizer (e.g., 'Adam', 'SGD') and learning rate to be set via flags.
-      * Save the weight trajectory at each epoch to a uniquely named directory (specified by a `--run-name` flag) as `.safetensors` files.
-  * **In `train-optimizer` mode:**
-      * Dynamically load the generative optimizer model (e.g., `PerceiverOptimizer`) specified by a `--optimizer-model` flag.
-      * Load the appropriate weight trajectory based on the `--run-name` flag.
-      * Use the `WeightTrajectoryDataset`, respecting the `--training-mode` flag ('sequential' or 'permutation').
-      * Implement a standard training loop to train the generative optimizer.
-      * Implement checkpointing: save the model state periodically to the `checkpoints/` directory.
-      * Implement resuming: if a `--resume-from` flag is provided with a path to a checkpoint, the script must load the model state and continue training from that point.
+    # misc -----------------------------------------------------------------
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", choices=["cpu", "cuda"], default=None,
+                   help="Override device auto‑detect")
 
------
+    cfg = p.parse_args()
 
-## 5. Testing & Experimentation Protocol
+    # Override / define from YAML/JSON if provided -------------------------
+    if cfg.config:
+        with open(cfg.config) as f:
+            data: Dict[str, Any] = yaml.safe_load(f) if cfg.config.endswith(('.yml', '.yaml')) else json.load(f)
+        cfg.__dict__.update(data)  # unsafe but convenient
 
-After implementing the above, you are to verify your work by running the following experimental protocol:
+    # sanity checks --------------------------------------------------------
+    if not cfg.checkpoints_dir:
+        p.error("--checkpoints-dir is required (either CLI or YAML)")
 
-1.  **Execute Phase 1:** Run `train.py train-target` for the `TargetCNN` model for 10 epochs. Give it a clear run name, for example:
-    ```bash
-    python train.py train-target --run-name "cnn_initial_test" --target-model "TargetCNN" --epochs 10
-    ```
-2.  **Execute Phase 2:** Run `train.py train-optimizer` to train the `PerceiverOptimizer` on the trajectory you just created. Use 'permutation' mode for 20 epochs.
-    ```bash
-    python train.py train-optimizer --run-name "cnn_initial_test" --optimizer-model "PerceiverOptimizer" --epochs 20 --training-mode "permutation"
-    ```
-3.  **Verify Checkpointing:** Confirm that checkpoint files are being saved in the `checkpoints/` directory.
-4.  **Verify Resuming:** Run the Phase 2 command again, but this time for 10 more epochs, using the `--resume-from` flag to point to the last saved checkpoint.
-    ```bash
-    python train.py train-optimizer --run-name "cnn_initial_test" --epochs 10 --resume-from "checkpoints/PerceiverOptimizer_epoch_19.safetensors"
-    ```
+    return cfg
 
-Report on the successful completion of this protocol.
 
-## 6. Implementation Constraints and Directives
+# ---------------------------------------------------------------------------
+# 2. Dataset utilities
+# ---------------------------------------------------------------------------
 
-In addition to the tasks outlined above, you must strictly adhere to the following constraints during all implementation phases.
 
-### 6.1 No Placeholders or Dummy Implementations
+def collect_pairs(checkpoint_dir: str, mode: str = "trajectory") -> list[Tuple[str, str]]:
+    """Return list of (src_path, tgt_path) according to pairing strategy."""
+    files = sorted(Path(checkpoint_dir).glob("weights_epoch_*.pth"),
+                   key=lambda p: int(p.stem.split('_')[-1]))
+    if len(files) < 2:
+        raise RuntimeError(f"Need ≥2 checkpoint files in {checkpoint_dir}")
 
-All code you write must be complete and fully functional. The use of placeholders, stubs, or dummy code is strictly forbidden.
+    if mode == "init2final":
+        return [(str(files[0]), str(files[-1]))]
 
-* Do not use comments like `# TODO: Implement later`.
-* Do not implement functions or methods that simply `pass` or `raise NotImplementedError`.
-* Every piece of code must be ready to execute and contribute to the successful completion of the testing protocol outlined in Section 5.
+    pairs: list[Tuple[str, str]] = []
+    for i, src in enumerate(files[:-1]):
+        for j, tgt in enumerate(files[i + 1:], start=i + 1):
+            if mode == "trajectory" and j != i + 1:
+                continue
+            pairs.append((str(src), str(tgt)))
+    return pairs
 
-### 6.2 Adaptation Over Reinvention
 
-Your primary strategy must be to adapt and integrate the existing, high-quality code within this repository. Do not write new implementations of components that are already present and functional. This is a waste of time and computational resources.
+class WeightPairDataset(Dataset):
+    def __init__(self, ckpt_dir: str, ref_state_dict: Dict[str, torch.Tensor],
+                 pairing: str, sample_factor: float = 1.0):
+        super().__init__()
+        self.pairs = collect_pairs(ckpt_dir, pairing)
+        if sample_factor < 1.0:
+            random.shuffle(self.pairs)
+            keep = int(len(self.pairs) * sample_factor)
+            self.pairs = self.pairs[:keep]
+        self.flat_dim = get_target_model_flat_dim(ref_state_dict)
 
-* **The Perceiver IO Model**: This directive applies most critically to the Perceiver IO model. You **must not** attempt to reimplement the Perceiver architecture from scratch. You are required to import the `PerceiverIO` class directly from the provided source file and wrap it within the new `PerceiverOptimizer` class as specified in Task 4.3.
-* **The Target CNN**: Similarly, the `TargetCNN` is already defined and should be imported and used as-is.
-* **The Exception**: The main exception to this rule is the new master script, `train.py`. This script is intended to be a new file that orchestrates and controls the various adapted components from a central location.
+    def __len__(self) -> int:
+        return len(self.pairs)
 
-## 7. Principle II: Maximization of Information Density
+    def __getitem__(self, idx: int):
+        src_path, tgt_path = self.pairs[idx]
+        W_src = flatten_state_dict(torch.load(src_path))
+        W_tgt = flatten_state_dict(torch.load(tgt_path))
+        # timestep not used for pure denoising; keep shape compatibility
+        t = torch.tensor([0.0])
+        return W_src, W_tgt, t
 
-Every element of a generated artifact must serve a necessary and sufficient purpose. All redundant, tautological, or conversational elements must be eliminated.
 
-* **7.1. Prohibition of Placeholders**: All generated code must be complete and fully functional. The use of placeholders, stubs (`pass`), or comments like `# TODO` is strictly forbidden.
-* **7.2. Commentary is Forbidden**:. Code must be self-documenting through clear structure and naming. Comments are permissible only if they provide critical, non-obvious information required for operation (e.g., specifying the valid parameter space for a configuration key).
-* **7.3. Naming Conventions**: All names (files, classes, functions, variables) shall be concise yet unambiguous (e.g., `MnemoSyne_io.py` is superior to `new_model_script.py`).
+# ---------------------------------------------------------------------------
+# 3. Trainer
+# ---------------------------------------------------------------------------
 
-## 8. Principle III: Purpose-Driven Utility & Safety
 
-All outputs are functional components of a research apparatus. Your role is to provide tools suitable for an expert practitioner.
+def train(cfg: argparse.Namespace):
+    torch.manual_seed(cfg.seed)
+    device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-* **8.1. Modern Standards are Non-Negotiable**:
-    * **Serialization**: All model weights, checkpoints, and artifacts must be saved and loaded using the `safetensors` format for safety, speed, and interoperability. The use of Python's `pickle` format (`.pth`) for saving model weights is forbidden.
-    * **Environment**: The agent must assume a standard, modern Python environment. All necessary third-party libraries (e.g., `torch`, `safetensors`, `gymnasium`) are expected to be available.
+    # reference model (just for dimensionality)
+    ref_cnn = TargetCNN()
+    ref_sd = ref_cnn.state_dict()
+    flat_dim = get_target_model_flat_dim(ref_sd)
+
+    # dataset + loader
+    ds = WeightPairDataset(cfg.checkpoints_dir, ref_sd, cfg.pairing, cfg.trajectory_sample_factor)
+    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+
+    # model selection ------------------------------------------------------
+    if cfg.model == "mlp":
+        diffusion = SimpleWeightSpaceDiffusion(target_model_flat_dim=flat_dim,
+                                               time_emb_dim=cfg.time_emb_dim,
+                                               hidden_dim=cfg.hidden_dim).to(device)
+    else:
+        raise NotImplementedError(f"Model family '{cfg.model}' not implemented")
+
+    opt = optim.Adam(diffusion.parameters(), lr=cfg.lr)
+    criterion = nn.MSELoss()
+
+    print(f"[INFO] Training with {len(ds)} pairs on {device}; saving to {cfg.save_path}\n")
+
+    for epoch in range(1, cfg.epochs + 1):
+        diffusion.train()
+        running = 0.0
+        for W_src, W_tgt, t in dl:
+            W_src, W_tgt, t = W_src.to(device), W_tgt.to(device), t.to(device)
+            opt.zero_grad()
+            pred = diffusion(W_src, t)
+            loss = criterion(pred, W_tgt)
+            loss.backward()
+            opt.step()
+            running += loss.item()
+        avg = running / len(dl)
+        print(f"Epoch {epoch:3d}/{cfg.epochs} | loss = {avg:.6f}")
+
+    Path(cfg.save_path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(diffusion.state_dict(), cfg.save_path)
+    print(f"\n[SAVED] {cfg.save_path}")
+
+
+# ---------------------------------------------------------------------------
+# 4. Entry‑point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    cfg = parse_cfg()
+    try:
+        train(cfg)
+    except KeyboardInterrupt:
+        print("\n[ABORTED] Keyboard interrupt", file=sys.stderr)
+        sys.exit(1)
+
+
+Below is a project layout that usually feels “just right” for research prototypes that grow into longer-lived code-bases.  It keeps **every tunable piece in `configs/`**, all code under a single importable package (so you avoid `sys.path` hacks), and leaves plenty of room for experiments, saved weights, and notebooks.
+
+```
+synthnet-root/
+│
+├── README.md                 ← high-level overview & quick-start
+├── pyproject.toml / setup.cfg← optional, lets you `pip install -e .`
+│
+├── configs/                  ← **all YAML/JSON configs live here**
+│   ├── cnn_mnist.yml
+│   └── diffusion_mlp.yml
+│
+├── data/                     ← raw or pre-processed datasets (git-ignored)
+│
+├── checkpoints/              ← trained weights (git-ignored)
+│
+├── notebooks/                ← exploratory Jupyter / papers-with-code demos
+│
+├── scripts/                  ← thin bash helpers (submit to Slurm, etc.)
+│   └── train_diffusion.sh
+│
+└── src/
+    └── synthnet/             ← **single top-level Python package**
+        ├── __init__.py
+        │
+        ├── models/
+        │   ├── target_cnn.py
+        │   ├── perceiver_io.py
+        │   └── diffusion.py           ← SimpleWeightSpaceDiffusion, etc.
+        │
+        ├── data/
+        │   ├── pairing.py             ← collect_pairs(), WeightPairDataset
+        │   └── transforms.py          ← any future data-augs
+        │
+        ├── engine/
+        │   ├── train.py               ← generic Trainer loop
+        │   └── evaluate.py
+        │
+        ├── cli/
+        │   └── train_diffusion.py     ← **wrapper that calls engine.train()**
+        │                                (your new `train_diffusion_config.py`
+        │                                can live here unchanged)
+        │
+        ├── utils/
+        │   ├── io.py                  ← flatten_state_dict(), etc.
+        │   └── logging.py             ← colorful tqdm / wandb hooks
+        │
+        └── extensions/                ← any custom CUDA / C++ ops (optional)
+```
+
+### Why this works
+
+| Folder                    | Purpose                                                                                                                 | Typical imports                                                               |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **`src/synthnet/models`** | Self-contained NN modules. Zero side-effects; each file should still run a quick `__main__` sanity test.                | `from synthnet.models.diffusion import SimpleWeightSpaceDiffusion`            |
+| **`src/synthnet/data`**   | Datasets & pairing logic. Only import *light* things (no heavy NN deps).                                                | `from synthnet.data.pairing import WeightPairDataset`                         |
+| **`src/synthnet/engine`** | “Business logic” for training / evaluation.  Could be swapped for PyTorch-Lightning later.                              | `from synthnet.engine.train import train`                                     |
+| **`src/synthnet/cli`**    | Tiny entry-point scripts that parse `argparse` / OmegaConf, then call engine.  Keeps notebooks and shell scripts clean. | `$ python -m synthnet.cli.train_diffusion --config configs/diffusion_mlp.yml` |
+
+### Naming conventions
+
+* **Functions / variables** – follow PEP-8 (`snake_case`) and keep names “honest”:
+
+  * `flatten_state_dict`, `collect_pairs`, `make_dataloader`
+* **Modules** – one class (or small family) per file. Eg. `target_cnn.py`, `diffusion.py`.
+* **Config keys** – use kebab-case or snake\_case, but be consistent across YAML & CLI flags (`time_emb_dim`, `hidden_dim`, `pairing_strategy`, `batch_size`).
+
+### Where does your new trainer go?
+
+Your existing **`train_diffusion_config.py`** already looks great as a CLI entry-point.  You can:
+
+1. Move it to `src/synthnet/cli/train_diffusion.py` unchanged.
+2. Split heavy lifting into `src/synthnet/engine/train.py` so future front-ends (notebooks, Ray tune, etc.) can reuse it with two lines of code.
+
+Example stub:
+
+```python
+# src/synthnet/engine/train.py
+def train(cfg: Dict[str, Any]) -> None:
+    ...
+```
+
+```python
+# src/synthnet/cli/train_diffusion.py
+from synthnet.engine.train import train
+from synthnet.utils.config import parse_cfg   # the arg-parsing helper you wrote
+
+if __name__ == "__main__":
+    cfg = parse_cfg()
+    train(cfg)
+```
+
+### Quick wins once everything is under `src/`
+
+* **Editable install**: `pip install -e .` lets you run scripts from anywhere.
+* **No `sys.path.append`** shims inside notebooks.
+* **Unit tests**: `tests/` can import `synthnet.*` just like production code.
+* **Packaging**: if you ever open-source, `pip install synthnet` “just works.”
+
+---
 
