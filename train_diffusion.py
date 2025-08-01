@@ -6,7 +6,7 @@ import os
 import glob
 import numpy as np
 
-from diffusion_model import SimpleWeightSpaceDiffusion, flatten_state_dict, get_target_model_flat_dim
+from diffusion_model import WholeVectorPerceiver as Synth, flatten_state_dict, get_target_model_flat_dim
 from target_cnn import TargetCNN # To get a reference state_dict for unflattening
 
 class WeightcheckpointsDataset(Dataset):
@@ -105,10 +105,11 @@ def train_diffusion_model(
     print(f"Target model flattened dimension: {target_flat_dim}")
 
     # Initialize Diffusion Model
-    diffusion_model = SimpleWeightSpaceDiffusion(
-        target_model_flat_dim=target_flat_dim,
-        time_emb_dim=time_emb_dim,
-        hidden_dim=hidden_dim_diff_model
+    diffusion_model = Synth(
+        flat_dim=target_flat_dim,
+        latent_dim=512,
+        num_latents=64,
+        depth=6,
     ).to(device)
     print("Diffusion model initialized.")
 
@@ -161,7 +162,7 @@ if __name__ == '__main__':
 
     # Number of epochs to train the diffusion model
     DIFFUSION_EPOCHS = 60 # Adjust as needed, more epochs generally better
-    LEARNING_RATE_DIFFUSION = 0.0009
+    LEARNING_RATE_DIFFUSION = 5e-4
     BATCH_SIZE_DIFFUSION = 64 # Depends on memory and checkpoints length
 
     # Diffusion model architecture parameters

@@ -1,65 +1,37 @@
+import sys
+import pathlib
+sys.path.append(str(pathlib.Path(__file__).resolve().parent / "perceiver-pytorch-main"))
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from perceiver_pytorch.perceiver_io import PerceiverIO
 
-class SimpleWeightSpaceDiffusion(nn.Module):
-    """
-    A simplified diffusion model that operates directly in the weight space
-    of another neural network (the target CNN). It predicts a slightly "denoised"
-    set of weights given a "noisier" set and a timestep embedding.
 
-    This is a conceptual model. For complex weight spaces, this direct approach
-    might be challenging. U-Net architectures are common in image diffusion
-    but adapting them to arbitrary weight vector spaces requires careful design.
-    Here, we'll use a Multi-Layer Perceptron (MLP) for simplicity, assuming
-    the flattened weights of the target model as input.
-    """
-    def __init__(self, target_model_flat_dim, time_emb_dim=64, hidden_dim=512):
-        super(SimpleWeightSpaceDiffusion, self).__init__()
-        self.target_model_flat_dim = target_model_flat_dim
-        self.time_emb_dim = time_emb_dim
+class WholeVectorPerceiver(nn.Module):
+    """Perceiver-IO operating on the entire weight vector."""
 
-        # Time embedding network
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_emb_dim),
-            nn.ReLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
+    def __init__(self, flat_dim, timestep_dim=1, latent_dim=512, num_latents=64,
+                 depth=6, heads=8, dim_head=64):
+        super().__init__()
+        self.flat_dim = flat_dim
+        in_dim = flat_dim + timestep_dim
+        self.perceiver = PerceiverIO(
+            depth=depth,
+            dim=in_dim,
+            queries_dim=in_dim,
+            logits_dim=flat_dim,
+            latent_dim=latent_dim,
+            num_latents=num_latents,
+            cross_heads=1,
+            latent_heads=heads,
+            cross_dim_head=dim_head,
+            latent_dim_head=dim_head,
         )
 
-        # Main diffusion network (MLP based)
-        # Input: flattened noisy weights + time embedding
-        # Output: predicted denoised weights (or noise to subtract)
-        self.diffusion_mlp = nn.Sequential(
-            nn.Linear(target_model_flat_dim + time_emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, target_model_flat_dim) # Predicts the denoised weights
-        )
-
-    def forward(self, noisy_weights_flat, t):
-        """
-        Args:
-            noisy_weights_flat (torch.Tensor): Flattened "noisy" weights of the target model.
-                                                Shape: (batch_size, target_model_flat_dim)
-            t (torch.Tensor): Timestep, normalized (e.g., 0 to 1 or discrete steps).
-                              Shape: (batch_size, 1) or just (batch_size)
-        Returns:
-            torch.Tensor: Predicted "denoised" weights (or could be noise).
-                          Shape: (batch_size, target_model_flat_dim)
-        """
-        if t.ndim == 1:
-            t = t.unsqueeze(-1) # Ensure t is [batch_size, 1] for time_mlp
-
-        time_embedding = self.time_mlp(t.float()) # Ensure t is float
-
-        # Concatenate noisy weights and time embedding
-        x = torch.cat([noisy_weights_flat, time_embedding], dim=-1)
-
-        # Predict the denoised state (or the noise, depending on training target)
-        predicted_denoised_weights_flat = self.diffusion_mlp(x)
-
-        return predicted_denoised_weights_flat
+    def forward(self, noisy_w_flat, t):
+        x = torch.cat([noisy_w_flat, t], dim=-1)
+        x = x.unsqueeze(1)
+        out = self.perceiver(x, queries=x)
+        return out.squeeze(1)[..., :self.flat_dim]
 
 def get_target_model_flat_dim(target_model_state_dict):
     """Helper function to get the total number of parameters in a state_dict."""
@@ -95,8 +67,8 @@ if __name__ == '__main__':
     print(f"Flattened dimension of TargetCNN weights: {flat_dim}")
 
     # 2. Initialize the diffusion model
-    diffusion_model = SimpleWeightSpaceDiffusion(target_model_flat_dim=flat_dim)
-    print("\nSimpleWeightSpaceDiffusion model initialized:")
+    diffusion_model = WholeVectorPerceiver(flat_dim)
+    print("\nWholeVectorPerceiver model initialized:")
     print(diffusion_model)
 
     # 3. Create dummy input for the diffusion model

@@ -10,7 +10,7 @@ import glob
 # --- Model & Utility Imports ---
 from target_cnn import TargetCNN
 from train_vae_and_capture_checkpoints import IntelligentVAE, truly_analyze_dataset
-from diffusion_model import SimpleWeightSpaceDiffusion, flatten_state_dict, unflatten_to_state_dict, get_target_model_flat_dim
+from diffusion_model import WholeVectorPerceiver, flatten_state_dict, unflatten_to_state_dict, get_target_model_flat_dim
 
 # --- Evaluation Functions ---
 
@@ -135,7 +135,12 @@ def main():
     flat_dim = get_target_model_flat_dim(ref_state_dict)
 
     # 2. Load the corresponding diffusion model
-    diffusion_model = SimpleWeightSpaceDiffusion(target_model_flat_dim=flat_dim)
+    diffusion_model = WholeVectorPerceiver(
+        flat_dim=flat_dim,
+        latent_dim=512,
+        num_latents=64,
+        depth=6,
+    )
     diffusion_model.load_state_dict(torch.load(chosen_setup['diffusion_path'], map_location=device))
 
     # 3. Define initial weights based on experiment type

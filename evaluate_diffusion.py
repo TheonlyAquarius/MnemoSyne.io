@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import glob
 
 from target_cnn import TargetCNN
-from diffusion_model import SimpleWeightSpaceDiffusion, flatten_state_dict, unflatten_to_state_dict, get_target_model_flat_dim
+from diffusion_model import WholeVectorPerceiver, flatten_state_dict, unflatten_to_state_dict, get_target_model_flat_dim
 
 def evaluate_model_performance(model, test_loader, device, criterion):
     """Evaluates the model on the test set and returns accuracy and loss."""
@@ -89,22 +89,17 @@ def evaluate_diffusion_generated_checkpoints(
     # Infer diffusion model parameters (need to match how it was trained)
     # This is a simplification; ideally, these params would be saved with the model.
     # Assuming common parameters used in train_diffusion.py
-    # These must match the parameters used to train the diffusion_optimizer.pth
-    # If they don't match, the loaded state_dict will cause errors.
-    time_emb_dim_diff = 64 # Must match the one used for training
-    hidden_dim_diff = 512  # Must match the one used for training
-
-    diffusion_model = SimpleWeightSpaceDiffusion(
-        target_model_flat_dim=target_flat_dim,
-        time_emb_dim=time_emb_dim_diff, # Ensure this matches the trained model
-        hidden_dim=hidden_dim_diff      # Ensure this matches the trained model
+    diffusion_model = WholeVectorPerceiver(
+        flat_dim=target_flat_dim,
+        latent_dim=512,
+        num_latents=64,
+        depth=6,
     )
     try:
         diffusion_model.load_state_dict(torch.load(diffusion_model_path, map_location=device))
     except RuntimeError as e:
         print(f"Error loading diffusion model state_dict: {e}")
-        print("This often happens if the model architecture parameters (flat_dim, time_emb_dim, hidden_dim) do not match the saved model.")
-        print(f"Parameters used for loading: flat_dim={target_flat_dim}, time_emb_dim={time_emb_dim_diff}, hidden_dim={hidden_dim_diff}")
+        print("This often happens if the model architecture parameters do not match the saved model.")
         return
     diffusion_model.eval()
     print(f"Diffusion model loaded from {diffusion_model_path}")
