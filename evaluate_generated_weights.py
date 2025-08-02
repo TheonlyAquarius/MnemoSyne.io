@@ -1,20 +1,20 @@
+import sys
+
+if '--help' in sys.argv or '-h' in sys.argv:
+    print('Evaluation script for generated weights.')
+    sys.exit(0)
+
 import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
-import numpy as np
-import matplotlib.pyplot as plt
 import glob
-
-# --- Model & Utility Imports ---
-from target_cnn import TargetCNN
-from train_vae_and_capture_checkpoints import IntelligentVAE, truly_analyze_dataset
+import importlib
+import matplotlib.pyplot as plt
 from diffusion_model import WholeVectorPerceiver, flatten_state_dict, unflatten_to_state_dict, get_target_model_flat_dim
 
-# --- Evaluation Functions ---
-
-def evaluate_cnn_performance(model, test_loader, device, criterion):
+def evaluate_performance(model, test_loader, device, criterion):
     model.eval()
     test_loss, correct, total_samples = 0, 0, 0
     with torch.no_grad():
@@ -28,19 +28,39 @@ def evaluate_cnn_performance(model, test_loader, device, criterion):
             total_samples += data.size(0)
     return 100. * correct / total_samples, test_loss / total_samples
 
-def evaluate_vae_performance(model, test_loader, device, criterion):
-    model.eval()
-    test_loss, total_samples = 0, 0
-    with torch.no_grad():
-        for data, _ in test_loader:
-            data = data.to(device)
-            recon_batch, _, _ = model(data)
-            loss = criterion(recon_batch, data)
-            test_loss += loss.item() * data.size(0)
-            total_samples += data.size(0)
-    return 0.0, test_loss / total_samples # Return 0 for accuracy as it's not applicable
+# KEY
+# evaluate_performance: compute accuracy and loss for a classifier
 
-# --- Core Logic ---
+def build_registry():
+    registry = {}
+    models_dir = os.path.join(os.path.dirname(__file__), 'models')
+    for fname in os.listdir(models_dir):
+        if fname.startswith('target_') and fname.endswith('.py'):
+            key = fname[7:-3]
+            mod = importlib.import_module(f'models.{fname[:-3]}')
+            cls = None
+            for val in vars(mod).values():
+                if isinstance(val, type):
+                    cls = val
+                    break
+            if cls:
+                registry[key] = {
+                    'model_class': cls,
+                    'eval_fn': evaluate_performance,
+                    'criterion_fn': lambda: nn.CrossEntropyLoss(reduction='sum'),
+                    'perf_metric': 'Accuracy (%)',
+                    'loss_metric': 'Avg Loss',
+                }
+    return registry
+
+# KEY
+# build_registry: dynamically create dictionary describing available target models
+
+MODEL_REGISTRY = build_registry()
+
+# KEY
+# MODEL_REGISTRY: mapping of model names to configuration details
+
 
 def generate_checkpoints(diffusion_model, initial_weights_flat, num_steps, ref_state_dict, device):
     print(f"Generating checkpoints for {num_steps} steps...")
@@ -57,6 +77,9 @@ def generate_checkpoints(diffusion_model, initial_weights_flat, num_steps, ref_s
             print(f"  Generated step {t_idx+1}/{num_steps}")
     return generated_weights
 
+# KEY
+# generate_checkpoints: create weight tensors by iterating the diffusion model
+
 def get_user_choice(options, prompt):
     print(prompt)
     for i, (key, val) in enumerate(options.items()):
@@ -70,30 +93,36 @@ def get_user_choice(options, prompt):
             pass
         print("Invalid input, please try again.")
 
+# KEY
+# get_user_choice: prompt user and return selected key from options
+
 def discover_setups():
     setups = {}
     diffusion_files = glob.glob("diffusion_optimizer*.pth")
     for df in diffusion_files:
         suffix = df.replace("diffusion_optimizer", "").replace(".pth", "")
         traj_dir = f"checkpoints_weights{suffix}"
-        if os.path.isdir(traj_dir):
-            model_type = 'VAE' if 'vae' in suffix else 'CNN'
-            setups[suffix[1:] if suffix.startswith('_') else suffix] = {
-                'description': f"Target: {model_type}, Diffusion Model: {df}, checkpoints: {traj_dir}",
-                'model_type': model_type,
+        arch = suffix[1:] if suffix.startswith('_') else suffix
+        if os.path.isdir(traj_dir) and arch in MODEL_REGISTRY:
+            desc = f"Target: {arch.upper()}, Diffusion Model: {df}, checkpoints: {traj_dir}"
+            setups[arch] = {
+                'description': desc,
+                'model_type': arch,
                 'diffusion_path': df,
-                'checkpoints_dir': traj_dir
+                'checkpoints_dir': traj_dir,
             }
     return setups
 
-# --- Main Execution ---
+# KEY
+# discover_setups: build dictionary describing available evaluation runs
+
 
 def main():
     setups = discover_setups()
     if not setups:
         print("Error: No valid evaluation setups found.")
-        print("Please ensure you have a trained diffusion model (e.g., 'diffusion_optimizer_cnn.pth')")
-        print("and its corresponding checkpoints directory (e.g., 'checkpoints_weights_cnn/').")
+        print("Please ensure you have a trained diffusion model (e.g., 'diffusion_optimizer_example.pth')")
+        print("and its corresponding checkpoints directory (e.g., 'checkpoints_weights_example/').")
         return
 
     if len(setups) == 1:
@@ -118,23 +147,20 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Select and instantiate the target model
-    if model_type == 'CNN':
-        target_model = TargetCNN()
-        eval_function = evaluate_cnn_performance
-        criterion = nn.CrossEntropyLoss(reduction='sum')
-        perf_metric, loss_metric = "Accuracy (%)", "Avg Loss"
-    else: # VAE
-        analysis = truly_analyze_dataset()
-        target_model = IntelligentVAE(analysis)
-        eval_function = evaluate_vae_performance
-        criterion = nn.MSELoss(reduction='sum')
-        perf_metric, loss_metric = "N/A", "Reconstruction Loss"
+    if model_type not in MODEL_REGISTRY:
+        print(f"Error: Architecture '{model_type}' not supported.")
+        return
+
+    arch_cfg = MODEL_REGISTRY[model_type]
+    target_model = arch_cfg['model_class']()
+    eval_function = arch_cfg['eval_fn']
+    criterion = arch_cfg['criterion_fn']()
+    perf_metric = arch_cfg['perf_metric']
+    loss_metric = arch_cfg['loss_metric']
 
     ref_state_dict = target_model.state_dict()
     flat_dim = get_target_model_flat_dim(ref_state_dict)
 
-    # 2. Load the corresponding diffusion model
     diffusion_model = WholeVectorPerceiver(
         flat_dim=flat_dim,
         latent_dim=512,
@@ -143,37 +169,32 @@ def main():
     )
     diffusion_model.load_state_dict(torch.load(chosen_setup['diffusion_path'], map_location=device))
 
-    # 3. Define initial weights based on experiment type
     if experiment_type == 'replicate':
         initial_weights_path = os.path.join(chosen_setup['checkpoints_dir'], "weights_epoch_0.pth")
         initial_state_dict = torch.load(initial_weights_path, map_location='cpu')
         print(f"Using initial weights from: {initial_weights_path}")
-    else: # generalize
+    else:
         print("Generating new, random initial weights for generalization test.")
-        new_random_model = target_model.__class__() if model_type == 'CNN' else IntelligentVAE(truly_analyze_dataset())
+        new_random_model = target_model.__class__()
         initial_state_dict = new_random_model.state_dict()
 
     initial_weights_flat = flatten_state_dict(initial_state_dict)
 
-    # 4. Generate the checkpoints
     num_steps = len(glob.glob(os.path.join(chosen_setup['checkpoints_dir'], "weights_epoch_*.pth"))) - 1
     generated_weights = generate_checkpoints(diffusion_model, initial_weights_flat, num_steps, ref_state_dict, device)
 
-    # 5. Evaluate the generated checkpoints
     print("\nEvaluating performance along the generated checkpoints...")
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
     test_loader = DataLoader(datasets.MNIST('./data', train=False, download=True, transform=transform), batch_size=256)
     
-    eval_model = target_model.__class__().to(device) if model_type == 'CNN' else IntelligentVAE(truly_analyze_dataset()).to(device)
+    eval_model = target_model.__class__().to(device)
 
     results = []
-    # Evaluate initial state
     eval_model.load_state_dict(initial_state_dict)
     perf, loss = eval_function(eval_model, test_loader, device, criterion)
     results.append((perf, loss))
     print(f"Step 0 (Initial Weights): {perf_metric.split(' ')[0]} = {perf:.2f}, {loss_metric} = {loss:.4f}")
 
-    # Evaluate generated states
     for i, weights in enumerate(generated_weights):
         state_dict = unflatten_to_state_dict(weights, ref_state_dict)
         eval_model.load_state_dict(state_dict)
@@ -181,7 +202,6 @@ def main():
         results.append((perf, loss))
         print(f"Generated Step {i+1}/{num_steps}: {perf_metric.split(' ')[0]} = {perf:.2f}, {loss_metric} = {loss:.4f}")
 
-    # 6. Plot the results
     print("\nPlotting results...")
     performances, losses = zip(*results)
     plt.figure(figsize=(12, 6))
@@ -192,7 +212,7 @@ def main():
     plt.title(f"{model_type} Performance from {experiment_type.capitalize()} Weights")
     plt.grid(True)
 
-    if model_type == 'CNN':
+    if perf_metric != 'N/A':
         ax2 = plt.gca().twinx()
         ax2.plot(performances, label=f"Generated {perf_metric}", marker='x', color='tab:blue')
         ax2.set_ylabel(perf_metric, color='tab:blue')
@@ -202,6 +222,9 @@ def main():
     plot_path = f"{model_type.lower()}_{experiment_type}_evaluation.png"
     plt.savefig(plot_path)
     print(f"Plot saved to {plot_path}")
+
+# KEY
+# main: orchestrate the evaluation workflow
 
 if __name__ == '__main__':
     main()
