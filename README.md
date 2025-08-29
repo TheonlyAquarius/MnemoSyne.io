@@ -1,192 +1,262 @@
-# Project Synthesis: A Foundational Study on a Universal Neural Network Weight Synthesizer
+# Diffusion Hypernetwork for Weight Generation — Technical Specification
 
-## 1. Introduction: The Grand Challenge - Beyond Architectural Imitation
-The practice of training deep neural networks, while profoundly successful, relies almost exclusively on iterative, gradient-based optimization methods. This process, though effective, is computationally expensive and offers limited insight into the fundamental structure of the high-dimensional parameter spaces being navigated. A significant advancement would be a system that can generate optimal weights directly, bypassing the iterative search entirely.
+## 1) **Project Goals & Constraints**
 
-### 1.1. Limitations of Current Approaches
-A superficial approach to this problem would be to create a supervised "meta-learner" trained on a vast corpus of different network architectures and their corresponding trained weights. Such a system, however, would be an exercise in large-scale pattern matching, not fundamental understanding. It would require the explicit labeling of each architecture (e.g., "this is a CNN," "this is a Transformer") and would be limited by the diversity of its training data.
+* **Objective:** Train a diffusion-based hypernetwork that generates full or low-rank delta weights for multiple target families.
+* **Target families (v1 scope):**
 
-### 1.2. The Vision: Universal Statistical Signatures
-MY  project posits a more elegant and powerful thesis: that there exists a universal statistical signature common to all well-trained neural network weights, regardless of the specific architecture from which they originate. This signature may be composed of properties such as specific weight distributions, inherent low-rank structures, sparsity patterns, and inter-layer statistical correlations. The grand challenge, therefore, is to create a generative model that learns this universal signature directly from an unlabeled, diverse dataset of effective weight tensors. Such a model would not be imitating the process of training; it would be generating artifacts that embody the principles of a successful outcome. It would be a true, universal weight synthesizer.
+  * **Image U-Nets:** 2D Conv U-Net (channels {64,128,256,512}, group norm, SiLU), latent-space U-Net (Stable-Diffusion-style block layout).
+  * **Transformers:** ViT-B/16 encoder, GPT-Small decoder (≈124M; attn heads {8,12}).
+  * **Classical CNNs:** ResNet-50 (BatchNorm), MobileNetV2 (BatchNorm).
+* **Outputs supported:**
 
-### 1.3. The Core Question
-Before embarking on this ambitious journey, it is first necessary to answer a more fundamental question: Is the core mechanism of a diffusion model even suitable for the complex task of structuring a chaotic, high-dimensional weight vector into a coherent, high-performing state? This document details the experiment designed to answer that question.
+  * Full tensors matching the family schema.
+  * LoRA/IA³ adapters per linear/conv weight as an option to cut compute and memory.
+* **Primary metrics:**
 
-## 2. A Foundational Proof-of-Concept: The MNIST Experiment
-To validate the core principle in a controlled and reproducible environment, we designed an experiment focused on a single, well-understood task: image classification on the MNIST dataset. The experiment was structured to test if a diffusion model, specialized for one specific architecture, could learn and then generalize the process of optimization for that architecture.
+  * **Downstream performance:** Top-1 val accuracy (imagenet-1k for vision), perplexity on held-out text for GPT-Small, mIoU on a small segmentation set for U-Net variant.
+  * **Reconstruction:** MSE/PSNR of weights vs ground truth; layer-wise cosine similarity.
+  * **Efficiency:** Inference steps ≤ 40 with target wall-clock ≤ 1.5× a standard DDIM run on A100 80GB.
+* **Constraints:** Single-node 8×A100 80GB training, mixed precision, max model RAM footprint ≤ 60GB.
+* **Format requirement:** **All input and output weights use `SafeTensor` (`.safetensors`)** with strict metadata schemas.
 
-### 2.1. The Target System: A Convolutional Neural Network on MNIST
-The "ground truth" for our experiment was established by a standard Convolutional Neural Network (CNN), defined in `target_cnn.py`.
+---
 
-#### 2.1.1. Architecture
-The architecture of the TargetMODEL which consisted of:
-- **Layer 1**: Convolutional layer with 32 filters, kernel size 3x3, followed by ReLU activation and MaxPooling layer with pool size 2x2.
-- **Layer 2**: Convolutional layer with 64 filters, kernel size 3x3, followed by ReLU activation and MaxPooling layer with pool size 2x2.
-- **Layer 3**: Flatten layer to convert the 2D feature maps into a 1D vector.
-- **Layer 4**: Fully connected linear layer with 128 units, followed by ReLU activation.
-- **Layer 5**: Fully connected linear layer with 10 units (output layer).
+## 2) **Data Ingestion & Preprocessing**
 
-The total number of trainable parameters in this specific architecture is precisely 421,642.
+* **Loading `.safetensors`:**
 
-#### 2.1.2. Task
-The task of the TargetCNN is to classify the 10 handwritten digits from the MNIST dataset.
+  * Use `safetensors` Python API with memory-mapping. For each file: read `metadata` block containing `{family, arch_version, tensor_names, dtypes, shapes, dataset_id, task_id, train_seed}`.
+  * Disallow `torch.load` and any pickle deserialization. Fail closed on missing metadata.
+* **Registry & shape validation:**
 
-#### 2.1.3. checkpoints Acquisition
-The TargetCNN was trained using conventional backpropagation and an optimizer (Adam). The pivotal step, executed by the `train_target_model.py` script, involved capturing the complete state of the model's 421,642 weights at the end of each training epoch. This created a sequential series of weight tensors, forming a discrete "optimization checkpoints" that represents the model's journey from a random initialization to a trained state.
+  * Maintain a **model registry** keyed by `(family, arch_version)` that enumerates ordered parameter specs:
+    `name, shape, dtype, role{weight|bias|norm_w|norm_b|embed}, fan_in, fan_out`.
+  * On load: verify exact set equality and per-tensor shape match; compute a stable **layout hash** to ensure architectural identity.
+* **Normalization:**
 
-### 2.2. The Meta-Optimizer: A Specialized Diffusion Model
-The agent trained to learn this checkpoints was a SimpleWeightSpaceDiffusion model, defined in `diffusion_model.py`.
+  * For each tensor `W`:
 
-#### 2.2.1. Architecture
-The architecture of the SimpleWeightSpaceDiffusion model is a Multi-Layer Perceptron (MLP). It is designed to be architecturally simple in order to isolate the effectiveness of the diffusion process itself. It contains:
-- A small time-embedding network with a hidden layer of 128 neurons.
-- A main MLP with two hidden layers of 512 neurons each.
+    * Compute per-tensor mean `μ` and std `σ` over elements. Store `(μ, σ)` in sidecar stats.
+    * Normalize to `\tilde{W} = (W - μ) / (σ + ε)`; for BatchNorm/LayerNorm scale/bias keep raw values but clip to `[-10,10]`.
+    * For conv/linear **weights only**, additionally apply fan-in scaling to unit variance at activation: `\tilde{W} ← \tilde{W} / √fan_in`.
+  * **Packing:** Flatten each tensor to 1-D, concatenate into a single vector `x ∈ ℝ^D` with an **offset index map** to enable scatter/gather back to shapes. Maintain per-block boundaries to preserve locality.
+* **Outlier handling:** Robust clip weights at 5× MAD per block. Record mask of clipped elements for analysis.
 
-#### 2.2.2. Task
-The task of this model was not to classify images, but to learn the state transitions within the CNN's weight-space. It was trained using the `train_diffusion.py` script. Specifically, given the weights from epoch N of the CNN's training, it was trained to predict the weights of epoch N+1. It learned to perform a single step of "denoising" or "optimizing" along the captured checkpoints.
+---
 
-### 2.3. Experimental Design for Validation
-The ultimate test of this system was not its ability to memorize the checkpoints it was trained on, but its ability to generalize its learned knowledge. The `evaluate_generalization.py` script was designed for this specific purpose.
+## 3) **Conditioning & Embedding**
 
-#### 2.3.1. Procedure
-The procedure was as follows:
-1. A new instance of the TargetCNN was created with a completely new, unseen, random initialization of its weights.
-2. This random weight vector was provided as the initial input to the trained SimpleWeightSpaceDiffusion model.
-3. The diffusion model was then applied iteratively for 6 steps. In each step, it generated a new, more "optimized" set of weights.
-4. After each generative step, the TargetCNN's parameters were updated with the newly synthesized weights, and its performance (Accuracy and Average Loss) was immediately evaluated on the MNIST test dataset.
+* **Architecture embedding:**
 
-## 3. Results: Affirming the Core Principle
-The generalization experiment yielded exceptionally clear and positive results, providing strong affirmation for the project's foundational hypothesis. The diffusion model successfully guided the new, randomly initialized CNN to a state of high performance without failure.
+  * Serialize registry graph (modules as nodes; edges = parent/child). Encode with a small **graph encoder**: 3× GraphSAGE layers → mean-pool → 256-D vector `e_arch`.
+  * Concatenate learned **role embeddings** for each block (conv, qkv, o, mlp-in, mlp-out, norm, embed).
+* **Dataset & task embeddings:**
 
-### 3.1. Quantitative Results
-The quantitative results of the checkpoints generated from the unseen random initialization are as follows:
+  * **Dataset ID:** Learned table `E_ds ∈ ℝ^{N_ds×128}` → 128-D `e_ds`.
+  * **Task spec:**
 
-| Generative Step | Model Accuracy (%) | Average Loss |
-|-----------------|--------------------|--------------|
-| 0 (Initial Random Weights) | 9.48% | 591.4088 |
-| 1 | 98.96% | 64.0916 |
-| 2 | 99.09% | 16.7626 |
-| 3 | 99.08% | 8.0734 |
-| 4 | 99.07% | 7.0694 |
-| 5 | 99.07% | 7.4064 |
-| 6 | 99.06% | 8.0632 |
+    * Structured tokens: `{task_type, label_space, resolution, modality}` mapped to embeddings and summed → 128-D `e_task`.
+    * Optional text descriptor routed through a frozen MiniLM or SBERT encoder to 256-D, then projected to 128-D if present.
+* **Global conditioning token:** `c = LayerNorm([e_arch | e_ds | e_task])` → 512-D, then MLP to 256-D.
+* **Time-step embedding:**
 
-### 3.2. Analysis
-The data demonstrates a remarkable phenomenon. The initial, randomly initialized model performs at chance level (9.48% accuracy). After a single generative step from the diffusion model, its accuracy leaps to 98.96%. This indicates that the diffusion process has learned a highly effective transformation to move weights from a chaotic state to a highly structured and promising region of the parameter space. Over the subsequent steps, the performance is refined until it reaches an exceptional 99.06% accuracy, a level competitive with a fully, conventionally trained model.
+  * Use **log-SNR** parameterization `λ(t)` (EDM style). Embed with sinusoidal features + 2-layer MLP with SiLU to 256-D.
+  * Conditioning modulation via **AdaLN**/FiLM in the backbone.
 
-### 3.3. Direct Comparison with Original CNN Training
-The evaluate_diffusion.py script also provided a direct, side-by-side comparison between the checkpoints generated by the diffusion model and the original path taken by the conventionally trained CNN.
+---
 
-| Step / Epoch | Diffusion Model Accuracy (%) | Original CNN Accuracy (%) |
-|--------------|------------------------------|-------------------------|
-| 0 (Initial) | 9.48% | 9.48% |
-| 1 | 98.96% | 98.43% |
-| 2 | 99.09% | 98.69% |
-| 3 | 99.08% | 99.00% |
-| 4 | 99.07% | 99.01% |
-| 5 | 99.07% | 98.86% |
-| 6 | 99.06% | - |
+## 4) **Diffusion Pipeline**
 
-### 3.4. Key Insights
-- **Accelerated Initial Convergence**: The diffusion model achieved 98.96% accuracy after a single generative step, surpassing the 98.43% accuracy of the original CNN after one full epoch.
-- **Superior Efficiency to Peak Performance**: The diffusion model reached 99.09% accuracy at generative step 2, whereas the original CNN required three full epochs to achieve a comparable performance milestone (99.00%).
+* **Data scaling:** Operate on normalized packed vector `x0` with unit variance by construction.
+* **Forward (noise) process:**
 
-## 4. Discussion: From Specialized Success to Universal Synthesis
-The success of this foundational experiment is profound. It confirms that the core mechanism—a diffusion model operating on the parameters of a neural network—is a viable and powerful method for synthesizing high-performing weights.
+  * Continuous-time EDM with log-SNR schedule `λ(t) ∈ [λ_min, λ_max]` linearly interpolated in `t ∈ [0,1]`.
+  * Convert to `(α_t, σ_t)` via `α_t = √(sigmoid(λ(t)))`, `σ_t = √(sigmoid(-λ(t)))`.
+  * **Noise operator $\xi_t$:**
 
-### 4.1. Limitations of the Current Implementation
-The current implementation is intentionally specialized and serves only as a proof-of-concept. The success of this specific instance allows us to chart a clear and confident path toward the grand challenge of universal synthesis. Achieving this goal will require addressing the limitations of the current system:
+    $$
+      x_t = \xi_t(x_0, \epsilon, t) = \alpha_t\,x_0 + \sigma_t\,\epsilon,\quad \epsilon \sim \mathcal{N}(0,I).
+    $$
+* **Prediction target:** **v-prediction** $v = \alpha_t \epsilon - \sigma_t x_0$ for improved stability on heavy-tailed weights.
+* **Reverse sampler (inference):**
 
-#### 4.1.1. Evolving from a Specialized MLP to a Graph-Aware Architecture
-The current diffusion model is "blind" to the structure of the weights it processes. The next stage of research will involve replacing the MLP with a Graph Neural Network (GNN). This will allow the model to ingest a formal description of any given architecture (as a computation graph), understand its structure, and condition the weight generation process on that specific structure.
+  * Default **DPM-Solver++(2M)**, 20–40 steps. Fallback **DDIM** for determinism, 50 steps.
+  * Classifier-free guidance on conditioning token (drop prob 0.1) to improve task adherence.
+  * Optional **x0-clamp per block** using recorded `(μ,σ)` to inverse-normalize safely.
 
-#### 4.1.2. Shifting from checkpoints Imitation to Learning Fundamental Properties
-The ultimate goal is to move beyond imitating specific training paths. The next generation of this model will be trained on a vast, unlabeled dataset of weight tensors from diverse, high-performing models. Its objective will be to learn the universal statistical signatures of effective weights—their distributions, low-rank properties, and sparsity patterns.
+---
 
-#### 4.1.3. Exploring Self-Improving Training Paradigms
-To achieve true "grokking" of optimization, a Reinforcement Learning (RL) framework will be explored. In this paradigm, the diffusion model will be rewarded for generating weights that result in high-performing networks. This will allow it to discover novel and potentially superior weight configurations through a process of guided trial and error, completely freeing it from the need for ground-truth training trajectories.
+## 5) **Weight-Generator Network Architecture**
 
-## 5. Conclusion
-This project began with an ambitious vision: to create a single generative model capable of synthesizing optimal weights for any neural network architecture on demand. We have successfully completed the first, critical phase of this research initiative. By demonstrating that a specialized diffusion model can take a randomly initialized CNN and guide it to a state of 98.85% accuracy on MNIST, we have validated the core principle that underpins the entire endeavor. This foundational success provides the empirical confidence needed to pursue the next stages of this research: developing graph-aware, hypernetwork-based diffusion models and training them via advanced paradigms like reinforcement learning to finally achieve the goal of a truly universal weight synthesizer.
+* **Backbone:** **Perceiver-Transformer** over block tokens.
 
-## 6. How to Replicate This Foundational Experiment
-To reproduce the exact results detailed in this document, please follow these steps.
+  * **Inputs:**
 
-### 6.1. Environment Setup
-It is highly recommended to use a Python virtual environment to manage dependencies.
+    * **Block tokens:** For each parameter block `b`, project its chunked noisy slice `x_t^{(b)}` (split into fixed 4k-length chunks) with linear → 256-D tokens.
+    * **Condition tokens:** `c` and role/arch tokens.
+    * **Time token:** `e_t`.
+  * **Latents:** 512 latent vectors (dim 512). 12 cross-attn + self-attn layers, RoPE, SwiGLU MLPs, Pre-LN, dropout 0.1.
+  * **Modulation:** AdaLN with `[e_t | c]` on all blocks.
+  * **Locality bias:** Per-layer attention masks to prefer attention within same module; periodic global tokens every 64 chunks.
+* **Heads:**
 
-```bash
-# Create a new virtual environment
-python -m venv synthesis_env
+  * For each chunk token → linear head predicts **v** with the same shape as input chunk.
+  * Merge chunk outputs back to block and then to the packed vector `\hat{v}`. Recover `\hat{x}_0` and `\hat{\epsilon}` as needed.
+* **LoRA mode (optional):**
 
-# Activate the environment
-# On macOS/Linux:
-source synthesis_env/bin/activate
+  * Predict rank-r factors `(A,B)` per linear/conv weight with small r∈{4,8}. Compose with base init `W = W_base + BA`.
+  * Same diffusion on concatenated `[vec(A), vec(B)]`.
 
-# On Windows:
-# synthesis_env\Scripts\activate
-```
+---
 
-### 6.2. Install Dependencies
-This experiment requires PyTorch, TorchVision, NumPy, and Matplotlib. Use the appropriate command for your system, installing the CUDA-enabled version of PyTorch if you have a compatible NVIDIA GPU for accelerated performance.
+## 6) **Training Objectives**
 
-```bash
-# Example for CPU-only installation:
-pip install torch torchvision numpy matplotlib
+* **Primary loss:**
 
-# For CUDA-enabled installation, please refer to the official PyTorch website for the correct command.
-```
+  $$
+    \mathcal{L} = \lambda_{\text{denoise}}\;\| \hat{v} - v \|_2^2
+      + \lambda_{\text{down}}\;\mathbb{E}_{\mathcal{D}_\text{val}}\big[\mathcal{L}_{\text{task}}(f_{\theta_{\text{gen}}}(x); \text{batch})\big]
+      + \lambda_{\text{reg}}\;\mathcal{R}.
+  $$
 
-### 6.3. Execution Protocol
-The scripts must be run in the following sequence, as each step generates the necessary artifacts for the next.
+  * `\mathcal{L}_{task}` = CE for classifiers, language modeling NLL for GPT-Small, Dice/BCE for segmentation.
+  * `\mathcal{R}` = weight-norm penalty on generated tensors, spectral norm soft cap per block, and KL on log-scales to discourage extreme magnitudes.
+* **Downstream coupling:**
 
-```bash
-# Step 1: Train the Target CNN and Capture its Optimization checkpoints
-# This script will train a CNN on MNIST and save its weights after each epoch
-# into a new directory named 'checkpoints_weights_cnn/'.
-python train_target_model.py
+  * Evaluate target model with **generated weights only**, no fine-tune, on a small fixed validation shard (e.g., 256 images or 2k tokens).
+  * **Frequency:** Apply downstream term on **25%** of steps via gradient stop-gap to control cost.
+  * **Tricks:** Freeze BatchNorm stats or recompute running stats once per sample; disable dropout.
+* **Weights:** Start with `λ_denoise=1.0, λ_down=0.05, λ_reg=1e-4`. Tune by Pareto sweeps.
 
-# Step 2: Train the Diffusion Model on the Captured checkpoints
-# This script reads the weights from the 'checkpoints_weights_cnn/' directory
-# and trains the diffusion model to learn the transitions. The trained model
-# will be saved as 'diffusion_optimizer.pth'.
-python train_diffusion.py
+---
 
-# Step 3: Run the Generalization Evaluation Experiment
-# This script performs the key validation test. It creates a new CNN with
-# random weights, then uses 'diffusion_optimizer.pth' to generate a new
-# checkpoints, printing the accuracy and loss at each step.
-python evaluate_generalization.py
-```
+## 7) **Training Setup**
 
-### 6.4. Expected Output
-Running the `evaluate_generalization.py` script will produce the following output:
+* **Datasets of weights:**
 
-```
-Starting evaluation of diffusion-generated checkpoints...
-Using device: cuda
-Target CNN: flat dimension = 421642
-Diffusion model loaded from diffusion_optimizer.pth
-Will generate a checkpoints of 6 steps.
-Generating checkpoints with diffusion model for 6 steps...
-Generated step 6/6
-Evaluating performance along the generated checkpoints...
-Step 0 (Initial Random Weights): Accuracy = 9.48%, Avg Loss = 591.4088
-Generated Step 1/6: Accuracy = 98.96%, Avg Loss = 64.0916
-Generated Step 2/6: Accuracy = 99.09%, Avg Loss = 16.7626
-Generated Step 3/6: Accuracy = 99.08%, Avg Loss = 8.0734
-Generated Step 4/6: Accuracy = 99.07%, Avg Loss = 7.0694
-Generated Step 5/6: Accuracy = 99.07%, Avg Loss = 7.4064
-Generated Step 6/6: Accuracy = 99.06%, Avg Loss = 8.0632
-Evaluating performance along the original CNN training checkpoints...
-Original CNN Epoch 0: Accuracy = 9.48%, Avg Loss = 591.4088
-Original CNN Epoch 1: Accuracy = 98.43%, Avg Loss = 13.0003
-Original CNN Epoch 2: Accuracy = 98.69%, Avg Loss = 10.4094
-Original CNN Epoch 3: Accuracy = 99.00%, Avg Loss = 7.3533
-Original CNN Epoch 4: Accuracy = 99.01%, Avg Loss = 7.7593
-Original CNN Epoch 5: Accuracy = 98.86%, Avg Loss = 8.8175
-Warning: Original weight file checkpoints_weights_cnn/weights_epoch_6.pth not found. Skipping.
-Plotting results...
-Plot saved to diffusion_evaluation_plot.png
-Evaluation finished.
-```
+  * Curate \~50k checkpoints across families, tasks, seeds, and training stages. Deduplicate via layout hash + per-block cosine threshold. Split by architecture to test cross-family generalization.
+* **Batching:** Pack `B=8–16` models per step; microbatch across devices. Randomize `t ~ U[0,1]`.
+* **Optimizer:** AdamW, β=(0.9,0.95), weight decay 0.05, lr 2e-4 with cosine decay and 10k warmup.
+* **Precision:** bfloat16 activations, fp32 master weights. Gradient checkpointing on attention + MLPs.
+* **Runtime:** EMA of model params with decay 0.999.
+* **Ablations planned:** v-pred vs ε-pred, EDM vs cosine schedule, LoRA rank, downstream frequency, Perceiver latents {256,512,1024}.
+
+---
+
+## 8) **Sampling & Output Reconstruction**
+
+* After the reverse pass, compute `\hat{x}_0` from `\hat{v}` and `(α_t,σ_t)`.
+* **Inverse normalization:** For each block: undo fan-in scaling and z-score using stored `(μ,σ)`.
+* **Safety bounds:** Clip extreme values using percentile caps per role; validate finite values.
+* **Reassemble tensors:** Scatter from packed vector using index map to exact shapes and dtypes.
+
+---
+
+## 9) **Evaluation Protocol**
+
+* **Reconstruction quality:** MSE, PSNR, and layer-wise cosine on held-out checkpoints.
+* **Downstream:**
+
+  * Vision: Top-1 on ImageNet-1k val for ResNet-50/ViT-B.
+  * Text: PPL on WikiText-103 subset for GPT-Small.
+  * U-Net: mIoU on small segmentation val or FID on a 10k synthetic set if applicable.
+* **Generalization:** Train on ResNet-50, test on MobileNetV2; train on ViT-B, test on ViT-S; measure delta vs Xavier/He init and vs matching real checkpoints.
+* **Efficiency:** Steps vs accuracy curves for 10, 20, 40 sampler steps.
+
+---
+
+## 10) **Integration & SafeTensor I/O**
+
+* **I/O guarantees:** All reads/writes via `safetensors`. No pickle.
+* **Read path:**
+
+  * `from safetensors.torch import load_file` with `device='cpu'`, `mmap=True`.
+  * Validate registry, compute layout hash, build offset map, capture `(μ,σ)` stats.
+* **Write path:**
+
+  * Repack tensors to original shapes and dtypes.
+  * `from safetensors.torch import save_file(state_dict, out_path, metadata=meta)` with metadata fields: `{family, arch_version, layout_hash, created_at, gen_model_commit, stats_version}`.
+  * Atomic write: write to temp + fsync + rename.
+* **Streaming:** For large tensors, stream pack/unpack by block to bounded CPU buffers; overlap CPU→GPU copy with compute using non-blocking transfers.
+* **Corruption checks:** SHA256 over concatenated tensors stored in metadata. On read, recompute and verify.
+* **Interoperability:** Provide adapters to and from PyTorch `state_dict` without `torch.save`: use direct assignment and `state_dict.copy_`.
+
+---
+
+## 11) **APIs & Schemas**
+
+* **Model registry entry (YAML):**
+
+  ```
+  family: resnet50
+  arch_version: v1
+  tensors:
+    - name: conv1.weight
+      shape: [64, 3, 7, 7]
+      dtype: float32
+      role: weight
+      fan_in: 147
+      fan_out: 64
+    - ...
+  ```
+* **Conditioning spec (JSON):**
+
+  ```
+  {
+    "dataset_id": "imagenet1k",
+    "task": {"type": "classification", "num_classes": 1000, "resolution": [224,224]},
+    "family": "resnet50",
+    "arch_version": "v1"
+  }
+  ```
+* **Python façade:**
+
+  * `generate_weights(cond: Dict, mode: {"full","lora"}, steps:int=30) -> Dict[str, Tensor]`
+  * `train_step(batch_of_checkpoints, cond_batch) -> LossDict`
+
+---
+
+## 12) **Security, Reproducibility, Compliance**
+
+* **Determinism:** Seed all RNGs; DDIM path for deterministic runs.
+* **Provenance:** Store `git_commit`, dataset hashes, and sampler settings in SafeTensor metadata.
+* **Privacy:** Strip any path or user info from metadata.
+* **Licensing:** Ensure only redistributable checkpoints in the training corpus.
+
+---
+
+## 13) **Milestones**
+
+1. **M0:** Registry + SafeTensor I/O + packing/unpacking validated on all families.
+2. **M1:** Denoising-only training to convergence on ResNet-50 weights.
+3. **M2:** Add downstream loss for ResNet-50 classification.
+4. **M3:** Extend to ViT-B and GPT-Small; unify conditioning.
+5. **M4:** LoRA mode + 20-step DPM-Solver++ parity with denoise-only baseline.
+6. **M5:** Cross-family generalization and full eval suite.
+
+---
+
+## 14) **Default Hyperparameters (v1)**
+
+* `λ_min=-13`, `λ_max=13`; ρ=7 for EDM noise scaling.
+* Sampler steps: 30, DPM-Solver++(2M).
+* Tokens: block chunk 4k, latent slots 512, depth 12, dim 512, heads 8, MLP ratio 4.
+* Batch size: effective 64 chunks per GPU via gradient accumulation.
+
+---
+
+## 15) **Acceptance Criteria**
+
+* SafeTensor-only I/O with schema validation and checksums.
+* ≤40 reverse steps reach within **95%** of real-checkpoint downstream metrics on held-out tasks.
+* Reconstruction cosine ≥ **0.98** median per block on validation checkpoints.
+* End-to-end generation time ≤ **2×** loading a standard checkpoint.
+
+---
+
+## 16) **Notes on Extensions**
+
+* Per-layer SDEs with layer-specific schedules.
+* Mixture-of-experts heads per family.
+* Distill the sampler to a small **rectified flow** network for 4–8 step inference later.
