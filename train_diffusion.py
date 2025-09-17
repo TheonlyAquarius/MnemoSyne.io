@@ -28,6 +28,7 @@ class WeightcheckpointsDataset(Dataset):
         self.checkpoints_dir = checkpoints_dir
         self.reference_state_dict = reference_state_dict
         self.flat_dim = get_target_model_flat_dim(reference_state_dict)
+        self.map_location = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         weight_files = sorted(
             glob.glob(os.path.join(checkpoints_dir, "weights_epoch_*.pth")),
@@ -61,10 +62,10 @@ class WeightcheckpointsDataset(Dataset):
         w_path_next = self.weight_files[idx+1]
 
         try:
-            state_dict_current = torch.load(w_path_current, map_location='cuda')
+            state_dict_current = torch.load(w_path_current, map_location=self.map_location)
             current_w = flatten_state_dict(state_dict_current)
 
-            state_dict_next = torch.load(w_path_next, map_location='cuda')
+            state_dict_next = torch.load(w_path_next, map_location=self.map_location)
             target_next_w = flatten_state_dict(state_dict_next)
 
             if current_w.shape[0] != self.flat_dim or target_next_w.shape[0] != self.flat_dim:

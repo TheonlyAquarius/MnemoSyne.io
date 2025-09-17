@@ -240,6 +240,6 @@ if __name__ == '__main__':
         evaluate_diffusion_generated_checkpoints(
             diffusion_model_path=DIFFUSION_MODEL_LOAD_PATH,
             target_cnn_reference=reference_cnn_instance,
-            checkpoints_dir_original_cnn=checkpoints_DIR,
+            checkpoints_dir_original_cnn=CNN_checkpoints_DIR,
             plot_results=True # Set to False if you don't have matplotlib or a display
         )
